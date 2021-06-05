@@ -16,6 +16,7 @@ using NSubstitute;
 using NUnit.Framework;
 using System.Windows.Input;
 using System.Reactive.Threading.Tasks;
+using Microsoft.VisualStudio.Threading;
 
 namespace UnitTests.GitHub.App.ViewModels.GitHubPane
 {
@@ -30,7 +31,7 @@ namespace UnitTests.GitHub.App.ViewModels.GitHubPane
             {
                 var target = CreateTarget();
 
-                await target.Load(CreatePullRequestModel(body: string.Empty));
+                await target.Load(CreatePullRequestModel());
 
                 Assert.That("*No description provided.*", Is.EqualTo(target.Body));
             }
@@ -612,7 +613,9 @@ namespace UnitTests.GitHub.App.ViewModels.GitHubPane
                 Substitute.For<IPullRequestFilesViewModel>(),
                 Substitute.For<ISyncSubmodulesCommand>(),
                 Substitute.For<IViewViewModelFactory>(),
-                gitService);
+                gitService,
+                Substitute.For<IOpenIssueishDocumentCommand>(),
+                new JoinableTaskContext());
             vm.InitializeAsync(repository, Substitute.For<IConnection>(), "owner", "repo", 1).Wait();
 
             return Tuple.Create(vm, pullRequestService);
@@ -620,7 +623,6 @@ namespace UnitTests.GitHub.App.ViewModels.GitHubPane
 
         static PullRequestDetailModel CreatePullRequestModel(
             int number = 1,
-            string body = "PR Body",
             IEnumerable<PullRequestReviewModel> reviews = null)
         {
             var author = Substitute.For<IAccount>();
@@ -632,7 +634,7 @@ namespace UnitTests.GitHub.App.ViewModels.GitHubPane
                 Number = number,
                 Title = "PR 1",
                 Author = new ActorModel(),
-                State = PullRequestStateEnum.Open,
+                State = PullRequestState.Open,
                 Body = string.Empty,
                 BaseRefName = "master",
                 BaseRefSha = "BASE_REF",

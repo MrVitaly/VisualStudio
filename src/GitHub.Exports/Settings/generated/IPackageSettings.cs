@@ -1,4 +1,4 @@
-﻿// This is an automatically generated file, based on settings.json and PackageSettingsGen.tt
+﻿﻿// This is an automatically generated file, based on settings.json and PackageSettingsGen.tt
 /* settings.json content:
 {
   "settings": [
@@ -6,16 +6,6 @@
       "name": "CollectMetrics",
       "type": "bool",
       "default": 'true'
-    },
-    {
-      "name": "EditorComments",
-      "type": "bool",
-      "default": "false"
-    },
-    {
-      "name": "ForkButton",
-      "type": "bool",
-      "default": "false"
     },
     {
       "name": "UIState",
@@ -45,8 +35,6 @@ namespace GitHub.Settings
     {
         void Save();
         bool CollectMetrics { get; set; }
-        bool EditorComments { get; set; }
-        bool ForkButton { get; set; }
         UIState UIState { get; set; }
         bool HideTeamExplorerWelcomeMessage { get; set; }
         bool EnableTraceLogging { get; set; }

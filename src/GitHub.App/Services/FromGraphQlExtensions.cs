@@ -1,6 +1,7 @@
 using System;
 using GitHub.Models;
 using Octokit.GraphQL.Model;
+using CheckAnnotationLevel = GitHub.Models.CheckAnnotationLevel;
 using CheckConclusionState = GitHub.Models.CheckConclusionState;
 using CheckStatusState = GitHub.Models.CheckStatusState;
 using PullRequestReviewState = GitHub.Models.PullRequestReviewState;
@@ -28,21 +29,25 @@ namespace GitHub.Services
                     return CheckConclusionState.Success;
                 case Octokit.GraphQL.Model.CheckConclusionState.Neutral:
                     return CheckConclusionState.Neutral;
+                case Octokit.GraphQL.Model.CheckConclusionState.Skipped:
+                    return CheckConclusionState.Skipped;
+                case Octokit.GraphQL.Model.CheckConclusionState.Stale:
+                    return CheckConclusionState.Stale;
                 default:
                     throw new ArgumentOutOfRangeException(nameof(value), value, null);
             }
         }
 
-        public static PullRequestStateEnum FromGraphQl(this PullRequestState value)
+        public static Models.PullRequestState FromGraphQl(this Octokit.GraphQL.Model.PullRequestState value)
         {
             switch (value)
             {
-                case PullRequestState.Open:
-                    return PullRequestStateEnum.Open;
-                case PullRequestState.Closed:
-                    return PullRequestStateEnum.Closed;
-                case PullRequestState.Merged:
-                    return PullRequestStateEnum.Merged;
+                case Octokit.GraphQL.Model.PullRequestState.Open:
+                    return Models.PullRequestState.Open;
+                case Octokit.GraphQL.Model.PullRequestState.Closed:
+                    return Models.PullRequestState.Closed;
+                case Octokit.GraphQL.Model.PullRequestState.Merged:
+                    return Models.PullRequestState.Merged;
                 default:
                     throw new ArgumentOutOfRangeException(nameof(value), value, null);
             }
@@ -84,7 +89,7 @@ namespace GitHub.Services
             }
         }
 
-        public static GitHub.Models.PullRequestReviewState FromGraphQl(this Octokit.GraphQL.Model.PullRequestReviewState value)
+        public static PullRequestReviewState FromGraphQl(this Octokit.GraphQL.Model.PullRequestReviewState value)
         {
             switch (value) {
                 case Octokit.GraphQL.Model.PullRequestReviewState.Pending:
@@ -97,6 +102,21 @@ namespace GitHub.Services
                     return PullRequestReviewState.ChangesRequested;
                 case Octokit.GraphQL.Model.PullRequestReviewState.Dismissed:
                     return PullRequestReviewState.Dismissed;
+                default:
+                    throw new ArgumentOutOfRangeException(nameof(value), value, null);
+            }
+        }
+
+        public static CheckAnnotationLevel FromGraphQl(this Octokit.GraphQL.Model.CheckAnnotationLevel value)
+        {
+            switch (value)
+            {
+                case Octokit.GraphQL.Model.CheckAnnotationLevel.Failure:
+                    return CheckAnnotationLevel.Failure;
+                case Octokit.GraphQL.Model.CheckAnnotationLevel.Notice:
+                    return CheckAnnotationLevel.Notice;
+                case Octokit.GraphQL.Model.CheckAnnotationLevel.Warning:
+                    return CheckAnnotationLevel.Warning;
                 default:
                     throw new ArgumentOutOfRangeException(nameof(value), value, null);
             }

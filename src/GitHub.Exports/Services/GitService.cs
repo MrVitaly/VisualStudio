@@ -16,11 +16,13 @@ namespace GitHub.Services
     public class GitService : IGitService
     {
         readonly IRepositoryFacade repositoryFacade;
+        readonly CompareOptions defaultCompareOptions;
 
         [ImportingConstructor]
         public GitService(IRepositoryFacade repositoryFacade)
         {
             this.repositoryFacade = repositoryFacade;
+            defaultCompareOptions = new CompareOptions { IndentHeuristic = true };
         }
 
         /// <summary>
@@ -38,18 +40,29 @@ namespace GitHub.Services
                 throw new ArgumentException("Path does not exist", nameof(localPath));
             }
 
-            var cloneUrl = GetUri(localPath);
-            var name = cloneUrl?.RepositoryName ?? dir.Name;
-
-            var model = new LocalRepositoryModel
+            using (var repository = GetRepository(localPath))
             {
-                LocalPath = localPath,
-                CloneUrl = cloneUrl,
-                Name = name,
-                Icon = Octicon.repo
-            };
+                UriString cloneUrl = null;
+                bool noOrigin = false;
+                if (repository != null)
+                {
+                    cloneUrl = GetUri(repository);
+                    noOrigin = HasRemotesButNoOrigin(repository);
+                }
 
-            return model;
+                var name = cloneUrl?.RepositoryName ?? dir.Name;
+
+                var model = new LocalRepositoryModel
+                {
+                    LocalPath = localPath,
+                    CloneUrl = cloneUrl,
+                    HasRemotesButNoOrigin = noOrigin,
+                    Name = name,
+                    Icon = Octicon.repo
+                };
+
+                return model;
+            }
         }
 
         public BranchModel GetBranch(LocalRepositoryModel model)
@@ -68,7 +81,8 @@ namespace GitHub.Services
                     repo: model,
                     sha: branch.Tip?.Sha,
                     isTracking: branch.IsTracking,
-                    trackedSha: branch.TrackedBranch?.Tip?.Sha);
+                    trackedSha: branch.TrackedBranch?.Tip?.Sha,
+                    trackedRemoteName: branch.TrackedBranch?.RemoteName);
             }
         }
 
@@ -117,6 +131,17 @@ namespace GitHub.Services
         {
             var repoPath = repositoryFacade.Discover(path);
             return repoPath == null ? null : repositoryFacade.NewRepository(repoPath);
+        }
+
+        /// <summary>
+        /// Find out if repository has remotes but none are called "origin".
+        /// </summary>
+        /// <param name="repo">The target repository.</param>
+        /// <returns>True if repository has remotes but none are called "origin".</returns>
+        public bool HasRemotesButNoOrigin(IRepository repo)
+        {
+            var remotes = repo.Network.Remotes;
+            return remotes["origin"] == null && remotes.Any();
         }
 
         /// <summary>
@@ -200,6 +225,99 @@ namespace GitHub.Services
                         }
                     }
 
+                    return null;
+                }
+            });
+        }
+
+        public Task<Patch> Compare(
+            IRepository repository,
+            string sha1,
+            string sha2,
+            string relativePath)
+        {
+            Guard.ArgumentNotNull(repository, nameof(repository));
+            Guard.ArgumentNotEmptyString(sha1, nameof(sha1));
+            Guard.ArgumentNotEmptyString(sha2, nameof(sha2));
+            Guard.ArgumentIsRelativePath(relativePath, nameof(relativePath));
+
+            var gitPath = Paths.ToGitPath(relativePath);
+            return Task.Run(() =>
+            {
+                var commit1 = repository.Lookup<Commit>(sha1);
+                var commit2 = repository.Lookup<Commit>(sha2);
+
+                if (commit1 != null && commit2 != null)
+                {
+                    return repository.Diff.Compare<Patch>(
+                        commit1.Tree,
+                        commit2.Tree,
+                        new[] { gitPath },
+                        defaultCompareOptions);
+                }
+                else
+                {
+                    return null;
+                }
+            });
+        }
+
+        public Task<ContentChanges> CompareWith(IRepository repository, string sha1, string sha2, string relativePath, byte[] contents)
+        {
+            Guard.ArgumentNotNull(repository, nameof(repository));
+            Guard.ArgumentNotEmptyString(sha1, nameof(sha1));
+            Guard.ArgumentNotEmptyString(sha2, nameof(sha1));
+            Guard.ArgumentIsRelativePath(relativePath, nameof(relativePath));
+
+            var gitPath = Paths.ToGitPath(relativePath);
+            return Task.Run(() =>
+            {
+                var commit1 = repository.Lookup<Commit>(sha1);
+                var commit2 = repository.Lookup<Commit>(sha2);
+
+                var treeChanges = repository.Diff.Compare<TreeChanges>(commit1.Tree, commit2.Tree, defaultCompareOptions);
+                var change = treeChanges.FirstOrDefault(x => x.Path == gitPath);
+                var oldPath = change?.OldPath;
+
+                if (commit1 != null && oldPath != null)
+                {
+                    var contentStream = contents != null ? new MemoryStream(contents) : new MemoryStream();
+                    var blob1 = commit1[oldPath]?.Target as Blob ?? repository.ObjectDatabase.CreateBlob(new MemoryStream());
+                    var blob2 = repository.ObjectDatabase.CreateBlob(contentStream, gitPath);
+                    return repository.Diff.Compare(blob1, blob2, defaultCompareOptions);
+                }
+
+                return null;
+            });
+        }
+
+        public Task<TreeChanges> Compare(
+            IRepository repository,
+            string sha1,
+            string sha2,
+            bool detectRenames)
+        {
+            Guard.ArgumentNotNull(repository, nameof(repository));
+            Guard.ArgumentNotEmptyString(sha1, nameof(sha1));
+            Guard.ArgumentNotEmptyString(sha2, nameof(sha2));
+
+            return Task.Run(() =>
+            {
+                var options = new CompareOptions
+                {
+                    Similarity = detectRenames ? SimilarityOptions.Renames : SimilarityOptions.None,
+                    IndentHeuristic = defaultCompareOptions.IndentHeuristic
+                };
+
+                var commit1 = repository.Lookup<Commit>(sha1);
+                var commit2 = repository.Lookup<Commit>(sha2);
+
+                if (commit1 != null && commit2 != null)
+                {
+                    return repository.Diff.Compare<TreeChanges>(commit1.Tree, commit2.Tree, options);
+                }
+                else
+                {
                     return null;
                 }
             });

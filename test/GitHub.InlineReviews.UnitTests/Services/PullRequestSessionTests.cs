@@ -644,9 +644,7 @@ Line 4";
             return new ActorModel { Login = login ?? "Viewer" };
         }
 
-        static PullRequestReviewCommentModel CreateComment(
-            string id = "comment1",
-            string body = "body")
+        static PullRequestReviewCommentModel CreateComment(string body = "body")
         {
             return new PullRequestReviewCommentModel
             {
@@ -815,7 +813,8 @@ Line 4";
                 Arg.Any<HostAddress>(),
                 Arg.Any<string>(),
                 Arg.Any<string>(),
-                Arg.Any<int>()).Returns(pullRequest);
+                Arg.Any<int>(),
+                Arg.Any<bool>()).Returns(pullRequest);
         }
     }
 }

@@ -1,6 +1,8 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.ComponentModel.Composition;
 using System.Globalization;
+using System.IO;
 using System.Linq;
 using System.Reactive.Linq;
 using System.Threading.Tasks;
@@ -22,6 +24,7 @@ namespace GitHub.ViewModels
     [PartCreationPolicy(CreationPolicy.NonShared)]
     public class PullRequestReviewCommentThreadViewModel : CommentThreadViewModel, IPullRequestReviewCommentThreadViewModel
     {
+        readonly ReactiveList<ICommentViewModel> comments = new ReactiveList<ICommentViewModel>();
         readonly IViewViewModelFactory factory;
         readonly ObservableAsPropertyHelper<bool> needsPush;
         IPullRequestSessionFile file;
@@ -50,6 +53,9 @@ namespace GitHub.ViewModels
         }
 
         /// <inheritdoc/>
+        public IReactiveList<ICommentViewModel> Comments => comments;
+
+        /// <inheritdoc/>
         public IPullRequestSession Session { get; private set; }
 
         /// <inheritdoc/>
@@ -65,6 +71,9 @@ namespace GitHub.ViewModels
         /// <inheritdoc/>
         public DiffSide Side { get; private set; }
 
+        /// <inheritdoc/>
+        public bool IsResolved { get; private set; }
+
         public bool IsNewThread
         {
             get => isNewThread;
@@ -73,6 +82,9 @@ namespace GitHub.ViewModels
 
         /// <inheritdoc/>
         public bool NeedsPush => needsPush.Value;
+
+        /// <inheritdoc/>
+        IReadOnlyReactiveList<ICommentViewModel> IPullRequestReviewCommentThreadViewModel.Comments => comments;
 
         /// <inheritdoc/>
         public async Task InitializeAsync(
@@ -89,6 +101,7 @@ namespace GitHub.ViewModels
             File = file;
             LineNumber = thread.LineNumber;
             Side = thread.DiffLineType == DiffChangeType.Delete ? DiffSide.Left : DiffSide.Right;
+            IsResolved = thread.IsResolved;
 
             foreach (var comment in thread.Comments)
             {
@@ -121,7 +134,8 @@ namespace GitHub.ViewModels
                     vm.Body = draft.Body;
                 }
 
-                AddPlaceholder(vm);
+                InitializePlaceholder(vm);
+                comments.Add(vm);
             }
         }
 
@@ -154,7 +168,8 @@ namespace GitHub.ViewModels
                 vm.Body = draft.Body;
             }
 
-            AddPlaceholder(vm);
+            InitializePlaceholder(vm);
+            comments.Add(vm);
         }
 
         public override async Task PostComment(ICommentViewModel comment)
@@ -183,7 +198,7 @@ namespace GitHub.ViewModels
                     await Session.PostReviewComment(
                         comment.Body,
                         File.CommitSha,
-                        File.RelativePath.Replace("\\", "/"),
+                        Paths.ToGitPath(File.RelativePath),
                         File.Diff,
                         diffPosition.DiffLineNumber).ConfigureAwait(false);
                 }
@@ -220,8 +235,8 @@ namespace GitHub.ViewModels
             string relativePath,
             int lineNumber)
         {
-            relativePath = relativePath.Replace("\\", "/");
-            var key = Invariant($"pr-review-comment|{cloneUri}|{pullRequestNumber}|{relativePath}");
+            var gitPath = Paths.ToGitPath(relativePath);
+            var key = Invariant($"pr-review-comment|{cloneUri}|{pullRequestNumber}|{gitPath}");
             return (key, lineNumber.ToString(CultureInfo.InvariantCulture));
         }
 

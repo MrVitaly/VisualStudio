@@ -8,7 +8,6 @@ using System.Reactive.Subjects;
 using System.Text;
 using System.Threading.Tasks;
 using GitHub.Api;
-using GitHub.App.Services;
 using GitHub.Factories;
 using GitHub.InlineReviews.Models;
 using GitHub.Models;
@@ -18,22 +17,15 @@ using GitHub.Services;
 using LibGit2Sharp;
 using Microsoft.VisualStudio.Text;
 using Microsoft.VisualStudio.Text.Projection;
-using Octokit;
 using Octokit.GraphQL;
-using Octokit.GraphQL.Core;
 using Octokit.GraphQL.Model;
 using ReactiveUI;
 using Serilog;
 using PullRequestReviewEvent = Octokit.PullRequestReviewEvent;
 using static Octokit.GraphQL.Variable;
-using CheckAnnotationLevel = GitHub.Models.CheckAnnotationLevel;
-using CheckConclusionState = GitHub.Models.CheckConclusionState;
-using CheckStatusState = GitHub.Models.CheckStatusState;
 using DraftPullRequestReviewComment = Octokit.GraphQL.Model.DraftPullRequestReviewComment;
 using FileMode = System.IO.FileMode;
 using NotFoundException = LibGit2Sharp.NotFoundException;
-using PullRequestReviewState = Octokit.GraphQL.Model.PullRequestReviewState;
-using StatusState = GitHub.Models.StatusState;
 
 // GraphQL DatabaseId field are marked as deprecated, but we need them for interop with REST.
 #pragma warning disable CS0618 
@@ -47,7 +39,8 @@ namespace GitHub.InlineReviews.Services
     public class PullRequestSessionService : IPullRequestSessionService
     {
         static readonly ILogger log = LogManager.ForContext<PullRequestSessionService>();
-        static ICompiledQuery<PullRequestDetailModel> readPullRequest;
+        static ICompiledQuery<PullRequestDetailModel> readPullRequestWithResolved;
+        static ICompiledQuery<PullRequestDetailModel> readPullRequestWithoutResolved;
         static ICompiledQuery<IEnumerable<LastCommitAdapter>> readCommitStatuses;
         static ICompiledQuery<IEnumerable<LastCommitAdapter>> readCommitStatusesEnterprise;
         static ICompiledQuery<ActorModel> readViewer;
@@ -98,23 +91,41 @@ namespace GitHub.InlineReviews.Services
         }
 
         /// <inheritdoc/>
+        public IReadOnlyList<InlineAnnotationModel> BuildAnnotations(
+            PullRequestDetailModel pullRequest,
+            string relativePath)
+        {
+            var gitPath = Paths.ToGitPath(relativePath);
+
+            return pullRequest.CheckSuites
+                ?.SelectMany(checkSuite => checkSuite.CheckRuns.Select(checkRun => new { checkSuite, checkRun }))
+                .SelectMany(arg =>
+                    arg.checkRun.Annotations
+                        .Where(annotation => annotation.Path == gitPath)
+                        .Select(annotation => new InlineAnnotationModel(arg.checkSuite, arg.checkRun, annotation)))
+                .OrderBy(tuple => tuple.StartLine)
+                .ToArray();
+        }
+
+        /// <inheritdoc/>
         public IReadOnlyList<IInlineCommentThreadModel> BuildCommentThreads(
             PullRequestDetailModel pullRequest,
             string relativePath,
             IReadOnlyList<DiffChunk> diff,
             string headSha)
         {
-            relativePath = relativePath.Replace("\\", "/");
+            var gitPath = Paths.ToGitPath(relativePath);
 
             var threadsByPosition = pullRequest.Threads
-                .Where(x => x.Path == relativePath && !x.IsOutdated)
+                .Where(x => x.Path == gitPath)
                 .OrderBy(x => x.Id)
                 .GroupBy(x => Tuple.Create(x.OriginalCommitSha, x.OriginalPosition));
             var threads = new List<IInlineCommentThreadModel>();
 
             foreach (var thread in threadsByPosition)
             {
-                var hunk = thread.First().DiffHunk;
+                var reviewThread = thread.First();
+                var hunk = reviewThread.DiffHunk;
                 var chunks = DiffUtilities.ParseFragment(hunk);
                 var chunk = chunks.Last();
                 var diffLines = chunk.Lines.Reverse().Take(5).ToList();
@@ -133,7 +144,8 @@ namespace GitHub.InlineReviews.Services
                     {
                         Comment = c,
                         Review = pullRequest.Reviews.FirstOrDefault(x => x.Comments.Contains(c)),
-                    })));
+                    })),
+                    reviewThread.IsResolved);
                 threads.Add(inlineThread);
             }
 
@@ -278,13 +290,29 @@ namespace GitHub.InlineReviews.Services
             return null;
         }
 
-        public virtual async Task<PullRequestDetailModel> ReadPullRequestDetail(HostAddress address, string owner, string name, int number)
+        public virtual Task<PullRequestDetailModel> ReadPullRequestDetail(HostAddress address, string owner, string name, int number, bool refresh = false)
         {
-            if (readPullRequest == null)
+            // The reviewThreads/isResolved field is only guaranteed to be available on github.com
+            if (address.IsGitHubDotCom())
             {
-                readPullRequest = new Query()
-                    .Repository(Var(nameof(owner)), Var(nameof(name)))
-                    .PullRequest(Var(nameof(number)))
+                return ReadPullRequestDetailWithResolved(address, owner, name, number, refresh);
+            }
+            else
+            {
+                return ReadPullRequestDetailWithoutResolved(address, owner, name, number, refresh);
+            }
+        }
+
+        async Task<PullRequestDetailModel> ReadPullRequestDetailWithResolved(HostAddress address, string owner,
+            string name, int number, bool refresh)
+        {
+            var itemTypes = new[] { PullRequestTimelineItemsItemType.IssueComment, PullRequestTimelineItemsItemType.PullRequestCommit };
+
+            if (readPullRequestWithResolved == null)
+            {
+                readPullRequestWithResolved = new Query()
+                    .Repository(owner: Var(nameof(owner)), name: Var(nameof(name)))
+                    .PullRequest(number: Var(nameof(number)))
                     .Select(pr => new PullRequestDetailModel
                     {
                         Id = pr.Id.Value,
@@ -304,6 +332,206 @@ namespace GitHub.InlineReviews.Services
                         HeadRepositoryOwner = pr.HeadRepositoryOwner != null ? pr.HeadRepositoryOwner.Login : null,
                         State = pr.State.FromGraphQl(),
                         UpdatedAt = pr.UpdatedAt,
+                        CommentCount = pr.Comments(0, null, null, null).TotalCount,
+                        Comments = pr.Comments(null, null, null, null).AllPages().Select(comment => new CommentModel
+                        {
+                            Id = comment.Id.Value,
+                            Author = new ActorModel
+                            {
+                                Login = comment.Author.Login,
+                                AvatarUrl = comment.Author.AvatarUrl(null),
+                            },
+                            Body = comment.Body,
+                            CreatedAt = comment.CreatedAt,
+                            DatabaseId = comment.DatabaseId.Value,
+                            Url = comment.Url,
+                        }).ToList(),
+                        Threads = pr.ReviewThreads(null, null, null, null).AllPages().Select(thread => new PullRequestReviewThreadModel
+                        {
+                            Comments = thread.Comments(null, null, null, null, null).AllPages().Select(comment => new CommentAdapter
+                            {
+                                Id = comment.Id.Value,
+                                PullRequestId = comment.PullRequest.Number,
+                                DatabaseId = comment.DatabaseId.Value,
+                                Author = new ActorModel
+                                {
+                                    Login = comment.Author.Login,
+                                    AvatarUrl = comment.Author.AvatarUrl(null),
+                                },
+                                Body = comment.Body,
+                                Path = comment.Path,
+                                CommitSha = comment.Commit.Oid,
+                                DiffHunk = comment.DiffHunk,
+                                Position = comment.Position,
+                                OriginalPosition = comment.OriginalPosition,
+                                OriginalCommitId = comment.OriginalCommit.Oid,
+                                ReplyTo = comment.ReplyTo != null ? comment.ReplyTo.Id.Value : null,
+                                PullRequestReviewId = comment.PullRequestReview != null ? comment.PullRequestReview.Id.Value : null,
+                                CreatedAt = comment.CreatedAt,
+                                Url = comment.Url
+                            }).ToList(),
+                            IsResolved = thread.IsResolved
+                        }).ToList(),
+                        Reviews = pr.Reviews(null, null, null, null, null, null).AllPages().Select(review => new PullRequestReviewModel
+                        {
+                            Id = review.Id.Value,
+                            Body = review.Body,
+                            CommitId = review.Commit.Oid,
+                            State = review.State.FromGraphQl(),
+                            SubmittedAt = review.SubmittedAt,
+                            Author = new ActorModel
+                            {
+                                Login = review.Author.Login,
+                                AvatarUrl = review.Author.AvatarUrl(null)
+                            }
+                        }).ToList(),
+                        Timeline = pr.TimelineItems(null, null, null, null, itemTypes, null, null).AllPages().Select(item => item.Switch<object>(when =>
+                            when.PullRequestCommit(commit => new CommitModel
+                            {
+                                AbbreviatedOid = commit.Commit.AbbreviatedOid,
+                                Author = new CommitActorModel
+                                {
+                                    Name = commit.Commit.Author.Name,
+                                    Email = commit.Commit.Author.Email,
+                                    User = commit.Commit.Author.User != null ? new ActorModel
+                                    {
+                                        Login = commit.Commit.Author.User.Login,
+                                        AvatarUrl = commit.Commit.Author.User.AvatarUrl(null),
+                                    } : null
+                                },
+                                MessageHeadline = commit.Commit.MessageHeadline,
+                                Oid = commit.Commit.Oid,
+                            }).IssueComment(comment => new CommentModel
+                            {
+                                Author = new ActorModel
+                                {
+                                    Login = comment.Author.Login,
+                                    AvatarUrl = comment.Author.AvatarUrl(null),
+                                },
+                                Body = comment.Body,
+                                CreatedAt = comment.CreatedAt,
+                                DatabaseId = comment.DatabaseId.Value,
+                                Id = comment.Id.Value,
+                                Url = comment.Url,
+                            }))).ToList()
+                    }).Compile();
+            }
+
+            var vars = new Dictionary<string, object>
+            {
+                { nameof(owner), owner },
+                { nameof(name), name },
+                { nameof(number), number },
+            };
+
+            var connection = await graphqlFactory.CreateConnection(address);
+            var result = await connection.Run(readPullRequestWithResolved, vars, refresh);
+
+            var apiClient = await apiClientFactory.Create(address);
+
+            var files = await log.TimeAsync(nameof(apiClient.GetPullRequestFiles),
+                async () => await apiClient.GetPullRequestFiles(owner, name, number).ToList());
+
+            var lastCommitModel = await log.TimeAsync(nameof(GetPullRequestLastCommitAdapter),
+                () => GetPullRequestLastCommitAdapter(address, owner, name, number, refresh));
+
+            result.Statuses = (IReadOnlyList<StatusModel>)lastCommitModel.Statuses ?? Array.Empty<StatusModel>();
+
+            if (lastCommitModel.CheckSuites == null)
+            {
+                result.CheckSuites = Array.Empty<CheckSuiteModel>();
+            }
+            else
+            {
+                result.CheckSuites = lastCommitModel.CheckSuites;
+                foreach (var checkSuite in result.CheckSuites)
+                {
+                    checkSuite.HeadSha = lastCommitModel.HeadSha;
+                }
+            }
+
+            result.ChangedFiles = files.Select(file => new PullRequestFileModel
+            {
+                FileName = file.FileName,
+                Sha = file.Sha,
+                Status = (PullRequestFileStatus)Enum.Parse(typeof(PullRequestFileStatus), file.Status, true),
+            }).ToList();
+
+            foreach (var thread in result.Threads)
+            {
+                if (thread.Comments.Count > 0 && thread.Comments[0] is CommentAdapter adapter)
+                {
+                    thread.CommitSha = adapter.CommitSha;
+                    thread.DiffHunk = adapter.DiffHunk;
+                    thread.Id = adapter.Id;
+                    thread.IsOutdated = adapter.Position == null;
+                    thread.OriginalCommitSha = adapter.OriginalCommitId;
+                    thread.OriginalPosition = adapter.OriginalPosition;
+                    thread.Path = adapter.Path;
+                    thread.Position = adapter.Position;
+
+                    foreach (var comment in thread.Comments)
+                    {
+                        comment.Thread = thread;
+                    }
+                }
+            }
+
+            foreach (var review in result.Reviews)
+            {
+                review.Comments = result.Threads
+                    .SelectMany(t => t.Comments)
+                    .Cast<CommentAdapter>()
+                    .Where(c => c.PullRequestReviewId == review.Id)
+                    .ToList();
+            }
+
+            return result;
+        }
+
+        async Task<PullRequestDetailModel> ReadPullRequestDetailWithoutResolved(HostAddress address, string owner,
+            string name, int number, bool refresh)
+        {
+            var itemTypes = new[] { PullRequestTimelineItemsItemType.IssueComment, PullRequestTimelineItemsItemType.PullRequestCommit };
+
+            if (readPullRequestWithoutResolved == null)
+            {
+                readPullRequestWithoutResolved = new Query()
+                    .Repository(owner: Var(nameof(owner)), name: Var(nameof(name)))
+                    .PullRequest(number: Var(nameof(number)))
+                    .Select(pr => new PullRequestDetailModel
+                    {
+                        Id = pr.Id.Value,
+                        Number = pr.Number,
+                        Author = new ActorModel
+                        {
+                            Login = pr.Author.Login,
+                            AvatarUrl = pr.Author.AvatarUrl(null),
+                        },
+                        Title = pr.Title,
+                        Body = pr.Body,
+                        BaseRefSha = pr.BaseRefOid,
+                        BaseRefName = pr.BaseRefName,
+                        BaseRepositoryOwner = pr.Repository.Owner.Login,
+                        HeadRefName = pr.HeadRefName,
+                        HeadRefSha = pr.HeadRefOid,
+                        HeadRepositoryOwner = pr.HeadRepositoryOwner != null ? pr.HeadRepositoryOwner.Login : null,
+                        State = pr.State.FromGraphQl(),
+                        UpdatedAt = pr.UpdatedAt,
+                        CommentCount = pr.Comments(0, null, null, null).TotalCount,
+                        Comments = pr.Comments(null, null, null, null).AllPages().Select(comment => new CommentModel
+                        {
+                            Id = comment.Id.Value,
+                            Author = new ActorModel
+                            {
+                                Login = comment.Author.Login,
+                                AvatarUrl = comment.Author.AvatarUrl(null),
+                            },
+                            Body = comment.Body,
+                            CreatedAt = comment.CreatedAt,
+                            DatabaseId = comment.DatabaseId.Value,
+                            Url = comment.Url,
+                        }).ToList(),
                         Reviews = pr.Reviews(null, null, null, null, null, null).AllPages().Select(review => new PullRequestReviewModel
                         {
                             Id = review.Id.Value,
@@ -338,6 +566,34 @@ namespace GitHub.InlineReviews.Services
                                 Url = comment.Url,
                             }).ToList(),
                         }).ToList(),
+                        Timeline = pr.TimelineItems(null, null, null, null, itemTypes, null, null).AllPages().Select(item => item.Switch<object>(when =>
+                            when.PullRequestCommit(commit => new CommitModel
+                            {
+                                AbbreviatedOid = commit.Commit.AbbreviatedOid,
+                                Author = new CommitActorModel {
+                                    Name = commit.Commit.Author.Name,
+                                    Email = commit.Commit.Author.Email,
+                                    User = commit.Commit.Author.User != null ? new ActorModel
+                                    {
+                                        Login = commit.Commit.Author.User.Login,
+                                        AvatarUrl = commit.Commit.Author.User.AvatarUrl(null),
+                                    } : null
+                                },
+                                MessageHeadline = commit.Commit.MessageHeadline,
+                                Oid = commit.Commit.Oid,
+                            }).IssueComment(comment => new CommentModel
+                            {
+                                Author = new ActorModel
+                                {
+                                    Login = comment.Author.Login,
+                                    AvatarUrl = comment.Author.AvatarUrl(null),
+                                },
+                                Body = comment.Body,
+                                CreatedAt = comment.CreatedAt,
+                                DatabaseId = comment.DatabaseId.Value,
+                                Id = comment.Id.Value,
+                                Url = comment.Url,
+                            }))).ToList()
                     }).Compile();
             }
 
@@ -349,14 +605,30 @@ namespace GitHub.InlineReviews.Services
             };
 
             var connection = await graphqlFactory.CreateConnection(address);
-            var result = await connection.Run(readPullRequest, vars);
+            var result = await connection.Run(readPullRequestWithoutResolved, vars, refresh);
 
             var apiClient = await apiClientFactory.Create(address);
-            var files = await apiClient.GetPullRequestFiles(owner, name, number).ToList();
-            var lastCommitModel = await GetPullRequestLastCommitAdapter(address, owner, name, number);
 
-            result.Statuses = lastCommitModel.Statuses;
-            result.CheckSuites = lastCommitModel.CheckSuites;
+            var files = await log.TimeAsync(nameof(apiClient.GetPullRequestFiles),
+                async () => await apiClient.GetPullRequestFiles(owner, name, number).ToList());
+
+            var lastCommitModel = await log.TimeAsync(nameof(GetPullRequestLastCommitAdapter),
+                () => GetPullRequestLastCommitAdapter(address, owner, name, number, refresh));
+
+            result.Statuses = (IReadOnlyList<StatusModel>)lastCommitModel.Statuses ?? Array.Empty<StatusModel>();
+
+            if (lastCommitModel.CheckSuites == null)
+            {
+                result.CheckSuites = Array.Empty<CheckSuiteModel>();
+            }
+            else
+            {
+                result.CheckSuites = lastCommitModel.CheckSuites;
+                foreach (var checkSuite in result.CheckSuites)
+                {
+                    checkSuite.HeadSha = lastCommitModel.HeadSha;
+                }
+            }
 
             result.ChangedFiles = files.Select(file => new PullRequestFileModel
             {
@@ -365,7 +637,63 @@ namespace GitHub.InlineReviews.Services
                 Status = (PullRequestFileStatus)Enum.Parse(typeof(PullRequestFileStatus), file.Status, true),
             }).ToList();
 
-            BuildPullRequestThreads(result);
+            // Build pull request threads
+            var commentsByReplyId = new Dictionary<string, List<CommentAdapter>>();
+
+            // Get all comments that are not replies.
+            foreach (CommentAdapter comment in result.Reviews.SelectMany(x => x.Comments))
+            {
+                if (comment.ReplyTo == null)
+                {
+                    commentsByReplyId.Add(comment.Id, new List<CommentAdapter> { comment });
+                }
+            }
+
+            // Get the comments that are replies and place them into the relevant list.
+            foreach (CommentAdapter comment in result.Reviews.SelectMany(x => x.Comments).OrderBy(x => x.CreatedAt))
+            {
+                if (comment.ReplyTo != null)
+                {
+                    List<CommentAdapter> thread = null;
+
+                    if (commentsByReplyId.TryGetValue(comment.ReplyTo, out thread))
+                    {
+                        thread.Add(comment);
+                    }
+                }
+            }
+
+            // Build a collection of threads for the information collected above.
+            var threads = new List<PullRequestReviewThreadModel>();
+
+            foreach (var threadSource in commentsByReplyId)
+            {
+                var adapter = threadSource.Value[0];
+
+                var thread = new PullRequestReviewThreadModel
+                {
+                    Comments = threadSource.Value,
+                    CommitSha = adapter.CommitSha,
+                    DiffHunk = adapter.DiffHunk,
+                    Id = adapter.Id,
+                    IsOutdated = adapter.Position == null,
+                    OriginalCommitSha = adapter.OriginalCommitId,
+                    OriginalPosition = adapter.OriginalPosition,
+                    Path = adapter.Path,
+                    Position = adapter.Position,
+                };
+
+                // Set a reference to the thread in the comment.
+                foreach (var comment in threadSource.Value)
+                {
+                    comment.Thread = thread;
+                }
+
+                threads.Add(thread);
+            }
+
+            result.Threads = threads;
+
             return result;
         }
 
@@ -383,7 +711,7 @@ namespace GitHub.InlineReviews.Services
             }
 
             var connection = await graphqlFactory.CreateConnection(address);
-            return await connection.Run(readViewer);
+            return await connection.Run(readViewer, cacheDuration: TimeSpan.FromMinutes(10));
         }
 
         public async Task<string> GetGraphQLPullRequestId(
@@ -391,11 +719,11 @@ namespace GitHub.InlineReviews.Services
             string repositoryOwner,
             int number)
         {
-            var address = HostAddress.Create(localRepository.CloneUrl.Host);
+            var address = HostAddress.Create(localRepository.CloneUrl);
             var graphql = await graphqlFactory.CreateConnection(address);
 
             var query = new Query()
-                .Repository(repositoryOwner, localRepository.Name)
+                .Repository(owner: repositoryOwner, name: localRepository.Name)
                 .PullRequest(number)
                 .Select(x => x.Id);
 
@@ -450,10 +778,10 @@ namespace GitHub.InlineReviews.Services
             LocalRepositoryModel localRepository,
             string pullRequestId)
         {
-            var address = HostAddress.Create(localRepository.CloneUrl.Host);
+            var address = HostAddress.Create(localRepository.CloneUrl);
             var graphql = await graphqlFactory.CreateConnection(address);
             var (_, owner, number) = await CreatePendingReviewCore(localRepository, pullRequestId);
-            var detail = await ReadPullRequestDetail(address, owner, localRepository.Name, number);
+            var detail = await ReadPullRequestDetail(address, owner, localRepository.Name, number, true);
 
             await usageTracker.IncrementCounter(x => x.NumberOfPRReviewDiffViewInlineCommentStartReview);
 
@@ -465,7 +793,7 @@ namespace GitHub.InlineReviews.Services
             LocalRepositoryModel localRepository,
             string reviewId)
         {
-            var address = HostAddress.Create(localRepository.CloneUrl.Host);
+            var address = HostAddress.Create(localRepository.CloneUrl);
             var graphql = await graphqlFactory.CreateConnection(address);
 
             var delete = new DeletePullRequestReviewInput
@@ -482,7 +810,7 @@ namespace GitHub.InlineReviews.Services
                 });
 
             var result = await graphql.Run(mutation);
-            return await ReadPullRequestDetail(address, result.Login, localRepository.Name, result.Number);
+            return await ReadPullRequestDetail(address, result.Login, localRepository.Name, result.Number, true);
         }
 
         /// <inheritdoc/>
@@ -493,7 +821,7 @@ namespace GitHub.InlineReviews.Services
             string body,
             PullRequestReviewEvent e)
         {
-            var address = HostAddress.Create(localRepository.CloneUrl.Host);
+            var address = HostAddress.Create(localRepository.CloneUrl);
             var graphql = await graphqlFactory.CreateConnection(address);
 
             var addReview = new AddPullRequestReviewInput
@@ -514,7 +842,7 @@ namespace GitHub.InlineReviews.Services
 
             var result = await graphql.Run(mutation);
             await usageTracker.IncrementCounter(x => x.NumberOfPRReviewPosts);
-            return await ReadPullRequestDetail(address, result.Login, localRepository.Name, result.Number);
+            return await ReadPullRequestDetail(address, result.Login, localRepository.Name, result.Number, true);
         }
 
         public async Task<PullRequestDetailModel> SubmitPendingReview(
@@ -523,7 +851,7 @@ namespace GitHub.InlineReviews.Services
             string body,
             PullRequestReviewEvent e)
         {
-            var address = HostAddress.Create(localRepository.CloneUrl.Host);
+            var address = HostAddress.Create(localRepository.CloneUrl);
             var graphql = await graphqlFactory.CreateConnection(address);
 
             var submit = new SubmitPullRequestReviewInput
@@ -543,7 +871,7 @@ namespace GitHub.InlineReviews.Services
 
             var result = await graphql.Run(mutation);
             await usageTracker.IncrementCounter(x => x.NumberOfPRReviewPosts);
-            return await ReadPullRequestDetail(address, result.Login, localRepository.Name, result.Number);
+            return await ReadPullRequestDetail(address, result.Login, localRepository.Name, result.Number, true);
         }
 
         /// <inheritdoc/>
@@ -555,7 +883,7 @@ namespace GitHub.InlineReviews.Services
             string path,
             int position)
         {
-            var address = HostAddress.Create(localRepository.CloneUrl.Host);
+            var address = HostAddress.Create(localRepository.CloneUrl);
             var graphql = await graphqlFactory.CreateConnection(address);
 
             var comment = new AddPullRequestReviewCommentInput
@@ -577,7 +905,7 @@ namespace GitHub.InlineReviews.Services
 
             var result = await graphql.Run(addComment);
             await usageTracker.IncrementCounter(x => x.NumberOfPRReviewDiffViewInlineCommentPost);
-            return await ReadPullRequestDetail(address, result.Login, localRepository.Name, result.Number);
+            return await ReadPullRequestDetail(address, result.Login, localRepository.Name, result.Number, true);
         }
 
         /// <inheritdoc/>
@@ -587,7 +915,7 @@ namespace GitHub.InlineReviews.Services
             string body,
             string inReplyTo)
         {
-            var address = HostAddress.Create(localRepository.CloneUrl.Host);
+            var address = HostAddress.Create(localRepository.CloneUrl);
             var graphql = await graphqlFactory.CreateConnection(address);
 
             var comment = new AddPullRequestReviewCommentInput
@@ -607,7 +935,7 @@ namespace GitHub.InlineReviews.Services
 
             var result = await graphql.Run(addComment);
             await usageTracker.IncrementCounter(x => x.NumberOfPRReviewDiffViewInlineCommentPost);
-            return await ReadPullRequestDetail(address, result.Login, localRepository.Name, result.Number);
+            return await ReadPullRequestDetail(address, result.Login, localRepository.Name, result.Number, true);
         }
 
         /// <inheritdoc/>
@@ -619,12 +947,11 @@ namespace GitHub.InlineReviews.Services
             string path,
             int position)
         {
-            var address = HostAddress.Create(localRepository.CloneUrl.Host);
+            var address = HostAddress.Create(localRepository.CloneUrl);
             var graphql = await graphqlFactory.CreateConnection(address);
 
             var addReview = new AddPullRequestReviewInput
             {
-                Body = body,
                 CommitOID = commitId,
                 Event = Octokit.GraphQL.Model.PullRequestReviewEvent.Comment,
                 PullRequestId = new ID(pullRequestId),
@@ -649,7 +976,7 @@ namespace GitHub.InlineReviews.Services
 
             var result = await graphql.Run(mutation);
             await usageTracker.IncrementCounter(x => x.NumberOfPRReviewDiffViewInlineCommentPost);
-            return await ReadPullRequestDetail(address, result.Login, localRepository.Name, result.Number);
+            return await ReadPullRequestDetail(address, result.Login, localRepository.Name, result.Number, true);
         }
 
         /// <inheritdoc/>
@@ -671,7 +998,7 @@ namespace GitHub.InlineReviews.Services
             int pullRequestId,
             int commentDatabaseId)
         {
-            var address = HostAddress.Create(localRepository.CloneUrl.Host);
+            var address = HostAddress.Create(localRepository.CloneUrl);
             var apiClient = await apiClientFactory.Create(address);
 
             await apiClient.DeletePullRequestReviewComment(
@@ -680,7 +1007,7 @@ namespace GitHub.InlineReviews.Services
                 commentDatabaseId);
 
             await usageTracker.IncrementCounter(x => x.NumberOfPRReviewDiffViewInlineCommentDelete);
-            return await ReadPullRequestDetail(address, remoteRepositoryOwner, localRepository.Name, pullRequestId);
+            return await ReadPullRequestDetail(address, remoteRepositoryOwner, localRepository.Name, pullRequestId, true);
         }
 
         /// <inheritdoc/>
@@ -689,7 +1016,7 @@ namespace GitHub.InlineReviews.Services
             string commentNodeId,
             string body)
         {
-            var address = HostAddress.Create(localRepository.CloneUrl.Host);
+            var address = HostAddress.Create(localRepository.CloneUrl);
             var graphql = await graphqlFactory.CreateConnection(address);
 
             var updatePullRequestReviewCommentInput = new UpdatePullRequestReviewCommentInput
@@ -707,12 +1034,12 @@ namespace GitHub.InlineReviews.Services
 
             var result = await graphql.Run(editComment);
             await usageTracker.IncrementCounter(x => x.NumberOfPRReviewDiffViewInlineCommentPost);
-            return await ReadPullRequestDetail(address, result.Login, localRepository.Name, result.Number);
+            return await ReadPullRequestDetail(address, result.Login, localRepository.Name, result.Number, true);
         }
 
         async Task<(string id, string owner, int number)> CreatePendingReviewCore(LocalRepositoryModel localRepository, string pullRequestId)
         {
-            var address = HostAddress.Create(localRepository.CloneUrl.Host);
+            var address = HostAddress.Create(localRepository.CloneUrl);
             var graphql = await graphqlFactory.CreateConnection(address);
 
             var input = new AddPullRequestReviewInput
@@ -749,10 +1076,10 @@ namespace GitHub.InlineReviews.Services
 
         Task<IRepository> GetRepository(LocalRepositoryModel repository)
         {
-            return Task.Factory.StartNew(() => gitService.GetRepository(repository.LocalPath));
+            return Task.Run(() => gitService.GetRepository(repository.LocalPath));
         }
 
-        async Task<LastCommitAdapter> GetPullRequestLastCommitAdapter(HostAddress address, string owner, string name, int number)
+        async Task<LastCommitAdapter> GetPullRequestLastCommitAdapter(HostAddress address, string owner, string name, int number, bool refresh)
         {
             ICompiledQuery<IEnumerable<LastCommitAdapter>> query;
             if (address.IsGitHubDotCom())
@@ -760,22 +1087,36 @@ namespace GitHub.InlineReviews.Services
                 if (readCommitStatuses == null)
                 {
                     readCommitStatuses = new Query()
-                          .Repository(Var(nameof(owner)), Var(nameof(name)))
-                          .PullRequest(Var(nameof(number))).Commits(last: 1).Nodes.Select(
+                          .Repository(owner: Var(nameof(owner)), name: Var(nameof(name)))
+                          .PullRequest(number: Var(nameof(number))).Commits(last: 1).Nodes.Select(
                               commit => new LastCommitAdapter
                               {
+                                  HeadSha = commit.Commit.Oid,
                                   CheckSuites = commit.Commit.CheckSuites(null, null, null, null, null).AllPages(10)
                                       .Select(suite => new CheckSuiteModel
                                       {
                                           CheckRuns = suite.CheckRuns(null, null, null, null, null).AllPages(10)
                                               .Select(run => new CheckRunModel
                                               {
+                                                  Id = run.Id.Value,
                                                   Conclusion = run.Conclusion.FromGraphQl(),
                                                   Status = run.Status.FromGraphQl(),
                                                   Name = run.Name,
                                                   DetailsUrl = run.Permalink,
                                                   Summary = run.Summary,
-                                              }).ToList()
+                                                  Text = run.Text,
+                                                  Annotations = run.Annotations(null, null, null, null).AllPages()
+                                                      .Select(annotation => new CheckRunAnnotationModel
+                                                      {
+                                                          Title = annotation.Title,
+                                                          Message = annotation.Message,
+                                                          Path = annotation.Path,
+                                                          AnnotationLevel = annotation.AnnotationLevel.Value.FromGraphQl(),
+                                                          StartLine = annotation.Location.Start.Line,
+                                                          EndLine = annotation.Location.End.Line,
+                                                      }).ToList()
+                                              }).ToList(),
+                                          ApplicationName = suite.App != null ? suite.App.Name : "Private App"
                                       }).ToList(),
                                   Statuses = commit.Commit.Status
                                       .Select(context =>
@@ -784,7 +1125,7 @@ namespace GitHub.InlineReviews.Services
                                               State = statusContext.State.FromGraphQl(),
                                               Context = statusContext.Context,
                                               TargetUrl = statusContext.TargetUrl,
-                                              Description = statusContext.Description,
+                                              Description = statusContext.Description
                                           }).ToList()
                                       ).SingleOrDefault()
                               }
@@ -798,20 +1139,22 @@ namespace GitHub.InlineReviews.Services
                 if (readCommitStatusesEnterprise == null)
                 {
                     readCommitStatusesEnterprise = new Query()
-                     .Repository(Var(nameof(owner)), Var(nameof(name)))
-                     .PullRequest(Var(nameof(number))).Commits(last: 1).Nodes.Select(
+                     .Repository(owner: Var(nameof(owner)), name: Var(nameof(name)))
+                     .PullRequest(number: Var(nameof(number))).Commits(last: 1).Nodes.Select(
                          commit => new LastCommitAdapter
                          {
-                             Statuses = commit.Commit.Status
-                                 .Select(context =>
-                                     context.Contexts.Select(statusContext => new StatusModel
-                                     {
-                                         State = statusContext.State.FromGraphQl(),
-                                         Context = statusContext.Context,
-                                         TargetUrl = statusContext.TargetUrl,
-                                         Description = statusContext.Description,
-                                     }).ToList()
-                                 ).SingleOrDefault()
+                             Statuses = commit.Commit.Status == null ? null : commit.Commit.Status
+                                 .Select(context => context == null
+                                     ? null
+                                     : context.Contexts
+                                         .Select(statusContext => new StatusModel
+                                         {
+                                             State = statusContext.State.FromGraphQl(),
+                                             Context = statusContext.Context,
+                                             TargetUrl = statusContext.TargetUrl,
+                                             Description = statusContext.Description,
+                                         }).ToList()
+                                     ).SingleOrDefault()
                          }
                      ).Compile();
                 }
@@ -827,67 +1170,8 @@ namespace GitHub.InlineReviews.Services
             };
 
             var connection = await graphqlFactory.CreateConnection(address);
-            var result = await connection.Run(query, vars);
+            var result = await connection.Run(query, vars, refresh);
             return result.First();
-        }
-
-        static void BuildPullRequestThreads(PullRequestDetailModel model)
-        {
-            var commentsByReplyId = new Dictionary<string, List<CommentAdapter>>();
-           
-            // Get all comments that are not replies.
-            foreach (CommentAdapter comment in model.Reviews.SelectMany(x => x.Comments))
-            {
-                if (comment.ReplyTo == null)
-                {
-                    commentsByReplyId.Add(comment.Id, new List<CommentAdapter> { comment });
-                }
-            }
-
-            // Get the comments that are replies and place them into the relevant list.
-            foreach (CommentAdapter comment in model.Reviews.SelectMany(x => x.Comments).OrderBy(x => x.CreatedAt))
-            {
-                if (comment.ReplyTo != null)
-                {
-                    List<CommentAdapter> thread = null;
-
-                    if (commentsByReplyId.TryGetValue(comment.ReplyTo, out thread))
-                    {
-                        thread.Add(comment);
-                    }
-                }
-            }
-
-            // Build a collection of threads for the information collected above.
-            var threads = new List<PullRequestReviewThreadModel>();
-
-            foreach (var threadSource in commentsByReplyId)
-            {
-                var adapter = threadSource.Value[0];
-
-                var thread = new PullRequestReviewThreadModel
-                {
-                    Comments = threadSource.Value,
-                    CommitSha = adapter.CommitSha,
-                    DiffHunk = adapter.DiffHunk,
-                    Id = adapter.Id,
-                    IsOutdated = adapter.Position == null,
-                    OriginalCommitSha = adapter.OriginalCommitId,
-                    OriginalPosition = adapter.OriginalPosition,
-                    Path = adapter.Path,
-                    Position = adapter.Position,
-                };
-
-                // Set a reference to the thread in the comment.
-                foreach (var comment in threadSource.Value)
-                {
-                    comment.Thread = thread;
-                }
-
-                threads.Add(thread);
-            }
-
-            model.Threads = threads;
         }
 
         static Octokit.GraphQL.Model.PullRequestReviewEvent ToGraphQl(Octokit.PullRequestReviewEvent e)
@@ -914,6 +1198,7 @@ namespace GitHub.InlineReviews.Services
             public int OriginalPosition { get; set; }
             public string OriginalCommitId { get; set; }
             public string ReplyTo { get; set; }
+            public string PullRequestReviewId { get; set; }
         }
 
         class LastCommitAdapter
@@ -921,6 +1206,8 @@ namespace GitHub.InlineReviews.Services
             public List<CheckSuiteModel> CheckSuites { get; set; }
 
             public List<StatusModel> Statuses { get; set; }
+
+            public string HeadSha { get; set; }
         }
-    }   
+    }
 }

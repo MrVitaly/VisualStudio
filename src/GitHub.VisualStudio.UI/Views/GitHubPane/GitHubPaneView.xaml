@@ -7,6 +7,7 @@
              xmlns:views="clr-namespace:GitHub.VisualStudio.Views"
              xmlns:local="clr-namespace:GitHub.VisualStudio.Views.GitHubPane"
              xmlns:uic="clr-namespace:GitHub.VisualStudio.UI.Controls"
+             Background="{DynamicResource GitHubVsToolWindowBackground}"
              Foreground="{DynamicResource GitHubVsWindowText}"
              d:DesignHeight="300"
              d:DesignWidth="300"
@@ -43,6 +44,7 @@
     <uic:InfoPanel x:Name="infoPanel"
                    DockPanel.Dock="Top"
                    Message="{Binding Message}"
+                   ShowCloseButton="True"
                    VerticalAlignment="Top"/>
     <StackPanel DockPanel.Dock="Top"
                 Margin="6,9,9,5"
@@ -55,11 +57,8 @@
       <Separator Margin="5,-2,5,0"
                  Foreground="{DynamicResource GitHubPaneTitleBrush}"
                  Style="{StaticResource TitleVerticalSeparator}" />
-      <TextBlock Margin="0,-5,0,0"
-                 VerticalAlignment="Center"
-                 Foreground="{DynamicResource GitHubVsGrayText}"
-                 Text="{Binding LocalRepository.Name}" />
-    </StackPanel>
+            <ghfvs:GitHubActionLink Margin="0,-2.5,0,0" Command="{Binding BrowseRepository}" Content="{Binding LocalRepository.Name}" />
+        </StackPanel>
 
     <Separator Margin="0,0,0,2"
                DockPanel.Dock="Top"
@@ -68,7 +67,6 @@
     <Grid>
       <DockPanel Visibility="{Binding ContentOverride, Converter={ghfvs:EqualsToVisibilityConverter None}}">
         <ghfvs:GitHubProgressBar DockPanel.Dock="Top"
-                             Foreground="{DynamicResource GitHubAccentBrush}"
                              IsIndeterminate="True"
                              Style="{DynamicResource GitHubProgressBar}"
                              Visibility="{Binding Content.Content.IsBusy, Converter={ghfvs:BooleanToHiddenVisibilityConverter}, FallbackValue=Hidden}"/>

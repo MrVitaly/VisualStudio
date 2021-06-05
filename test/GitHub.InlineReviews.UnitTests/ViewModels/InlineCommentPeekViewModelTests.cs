@@ -244,7 +244,7 @@ namespace GitHub.InlineReviews.UnitTests.ViewModels
             Assert.That(placeholder.Body, Is.EqualTo(null));
         }
 
-        void AddCommentToExistingThread(IPullRequestSessionFile file)
+        static void AddCommentToExistingThread(IPullRequestSessionFile file)
         {
             var newThreads = file.InlineCommentThreads.ToList();
             var thread = file.InlineCommentThreads.Single();
@@ -272,8 +272,9 @@ namespace GitHub.InlineReviews.UnitTests.ViewModels
             var draftStore = Substitute.For<IMessageDraftStore>();
             var commentService = Substitute.For<ICommentService>();
             var result = Substitute.For<IViewViewModelFactory>();
+            var autoCompleteAdvisor = Substitute.For<IAutoCompleteAdvisor>();
             result.CreateViewModel<IPullRequestReviewCommentViewModel>().Returns(_ =>
-                new PullRequestReviewCommentViewModel(commentService));
+                new PullRequestReviewCommentViewModel(commentService, autoCompleteAdvisor));
             result.CreateViewModel<IPullRequestReviewCommentThreadViewModel>().Returns(_ =>
                 new PullRequestReviewCommentThreadViewModel(draftStore, result));
             return result;

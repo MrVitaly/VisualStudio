@@ -51,16 +51,12 @@ namespace GitHub.VisualStudio
         void LoadSettings()
         {
             child.CollectMetrics = packageSettings.CollectMetrics;
-            child.EditorComments = packageSettings.EditorComments;
-            child.ForkButton = packageSettings.ForkButton;
             child.EnableTraceLogging = packageSettings.EnableTraceLogging;
         }
 
         void SaveSettings()
         {
             packageSettings.CollectMetrics = child.CollectMetrics;
-            packageSettings.EditorComments = child.EditorComments;
-            packageSettings.ForkButton = child.ForkButton;
             packageSettings.EnableTraceLogging = child.EnableTraceLogging;
             packageSettings.Save();
         }

@@ -87,9 +87,9 @@ namespace GitHub.VisualStudio.Base
 
         void UpdateRepoOnMainThread(LocalRepositoryModel repo)
         {
-            holder.JoinableTaskFactory.RunAsync(async () =>
+            holder.JoinableTaskContext.Factory.RunAsync(async () =>
             {
-                await holder.JoinableTaskFactory.SwitchToMainThreadAsync();
+                await holder.JoinableTaskContext.Factory.SwitchToMainThreadAsync();
                 UpdateRepo(repo);
             }).Task.Forget();
         }
@@ -123,12 +123,8 @@ namespace GitHub.VisualStudio.Base
             }
         }
 
-        protected async Task<RepositoryOrigin> GetRepositoryOrigin()
+        protected async Task<RepositoryOrigin> GetRepositoryOrigin(UriString uri)
         {
-            if (ActiveRepo == null)
-                return RepositoryOrigin.NonGitRepository;
-
-            var uri = ActiveRepoUri;
             if (uri == null)
                 return RepositoryOrigin.Other;
 
@@ -154,15 +150,15 @@ namespace GitHub.VisualStudio.Base
             return RepositoryOrigin.Other;
         }
 
-        protected async Task<bool> IsAGitHubRepo()
+        protected async Task<bool> IsAGitHubRepo(UriString uri)
         {
-            var origin = await GetRepositoryOrigin();
+            var origin = await GetRepositoryOrigin(uri);
             return origin == RepositoryOrigin.DotCom || origin == RepositoryOrigin.Enterprise;
         }
 
-        protected async Task<bool> IsAGitHubDotComRepo()
+        protected async Task<bool> IsAGitHubDotComRepo(UriString uri)
         {
-            var origin = await GetRepositoryOrigin();
+            var origin = await GetRepositoryOrigin(uri);
             return origin == RepositoryOrigin.DotCom;
         }
 
